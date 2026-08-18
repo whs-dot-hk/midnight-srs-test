@@ -1,0 +1,545 @@
+// A social spaced-repetition system.
+//
+// One contract, three value/state mechanisms, each with a distinct job:
+//
+//   - UNSHIELDED bond (`bonds`)      — public by design. Makes a learner identity cost
+//                                      money, which is the only defence against Sybil
+//                                      farming of the public streak ladder.
+//   - SHIELDED XP coin               — a bearer reward. Transferable, and its value stays
+//                                      in the Zswap UTXO rather than the public ledger.
+//   - XP commitment (`xpCommit`)     — a private but non-inflatable score. Backs the
+//                                      tier ladder without publishing anyone's total.
+//
+// WHAT THE CIRCUIT ENFORCES, AND WHAT IT CANNOT
+//
+// `review` is a near-complete verifier of SM-2. It re-derives the ease transition, the
+// repetition count, the lapse count, and the interval, and rejects any proposal that
+// deviates. Two things are necessarily delegated to the client:
+//
+//   - floor division. Compact has no `/`, so `interval' = floor(interval * ease' / 1000)`
+//     is verified multiplicatively instead (see `checkIntervalGrowth`). The check is exact,
+//     not a bound.
+//   - reading the clock. Block time is *comparable* but not *readable* — there is no
+//     `now()` to assign from. So the client proposes `nextDue` and the circuit pins it to
+//     `(now, now + interval' * 86400]` using two predicates. See `pinToWindow`.
+//
+// What no on-chain design can enforce: whether the learner actually recalled the card.
+// `grade` is self-reported and always will be. This contract proves *diligence* — you were
+// due, you showed up, and your schedule obeys SM-2 — never *competence*.
+//
+// PRIVACY
+//
+// PUBLIC:  deck contents (shared decks are public by design, as in Anki), the learner
+//          pseudonym, every card's `dueAt`, review/lapse tallies, bond amounts, tier.
+// PRIVATE: the learner's XP total (commitment + shielded coin), and the mapping from
+//          pseudonym to wallet — identity is `persistentHash(["srs:pk:", sk])` over a
+//          self-chosen secret, never a wallet key.
+//
+// `dueAt` is public because `blockTimeGte` forces it: the compiler rejects gating on an
+// undisclosed witness ("might disclose the lower bound of the time being checked"). Review
+// intervals are a recall fingerprint, so a public `dueAt` leaks more than it appears to —
+// a card due six months out is one you know cold. Bucket `dueAt` to week granularity if
+// that matters more than tight gating.
+
+pragma language_version 0.23;
+import CompactStandardLibrary;
+
+// ---------------------------------------------------------------------------
+// SM-2 parameters.
+//
+// Compact 0.23 has no top-level `const`, so these are `pure circuit`s — which inline like
+// constants and stay checkable by name. Mirrored exactly in crates/srs-core/src/params.rs;
+// the Rust property tests assert every scheduler output satisfies the checks below.
+// ---------------------------------------------------------------------------
+
+// Ease is stored scaled by 1000 to keep the arithmetic integral (2500 == 2.5).
+pure circuit EASE_SCALE(): Uint<16> { return 1000; }
+pure circuit EASE_MIN(): Uint<16> { return 1300; }
+pure circuit EASE_MAX(): Uint<16> { return 4000; }
+pure circuit EASE_START(): Uint<16> { return 2500; }
+
+// A grade below this is a lapse.
+pure circuit GRADE_PASS(): Uint<8> { return 3; }
+pure circuit GRADE_MAX(): Uint<8> { return 5; }
+
+// SM-2's first two intervals are fixed rather than multiplicative.
+pure circuit INTERVAL_FIRST(): Uint<32> { return 1; }
+pure circuit INTERVAL_SECOND(): Uint<32> { return 6; }
+pure circuit INTERVAL_MAX_DAYS(): Uint<32> { return 36500; }
+
+pure circuit DAY_SECS(): Uint<64> { return 86400; }
+
+// How long after `dueAt` a learner may be slashed. Generous enough to absorb a missed day;
+// short enough that the ladder means something.
+pure circuit GRACE_SECS(): Uint<64> { return 172800; }
+
+// Unbonding delay — long enough that a slash cannot be dodged by racing a withdrawal.
+pure circuit UNBOND_COOLDOWN_SECS(): Uint<64> { return 604800; }
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+export struct Sched {
+  // Unix seconds. Public — see the privacy note above.
+  dueAt: Uint<64>;
+  intervalDays: Uint<32>;
+  // Scaled by EASE_SCALE, always within [EASE_MIN, EASE_MAX].
+  ease: Uint<16>;
+  reps: Uint<16>;
+  lapses: Uint<16>;
+}
+
+// The deck author's pseudonym. Fixed at deploy; only they may publish cards.
+export sealed ledger author: Bytes<32>;
+
+// Stake required to join, in the native token's smallest unit. Fixed at deploy so a learner
+// can see the price of entry before committing.
+export sealed ledger bondRequired: Uint<64>;
+
+// Deck contents, as content hashes. Public: a shared deck everyone studies.
+export ledger cards: Set<Bytes<32>>;
+
+// Group membership. Public — this design can hide your performance, not your affiliation.
+export ledger learners: Set<Bytes<32>>;
+
+export ledger bonds: Map<Bytes<32>, Uint<64>>;
+
+// Set by `requestUnbond`; `withdrawBond` refuses until block time passes it.
+export ledger unbondReadyAt: Map<Bytes<32>, Uint<64>>;
+
+// Per-learner, per-card schedule, keyed by `slotKey(learner, card)`. Flat rather than nested
+// (`Map<Bytes<32>, Map<...>>` also compiles) because a composite key avoids having to
+// initialise an inner map on first subscribe.
+export ledger sched: Map<Bytes<32>, Sched>;
+
+// The public diligence signal: reviews landed while due, and deadlines blown.
+export ledger reviewCount: Map<Bytes<32>, Uint<64>>;
+export ledger lapseCount: Map<Bytes<32>, Uint<64>>;
+
+// commit(xpTotal, salt) per learner. Chained on every review so a learner cannot inflate the
+// total they later prove a tier against.
+export ledger xpCommit: Map<Bytes<32>, Bytes<32>>;
+
+// Published tier, proven against `xpCommit` without revealing the total.
+export ledger tier: Map<Bytes<32>, Uint<8>>;
+
+// Slashed bonds accumulate here for the author to sweep.
+export ledger forfeited: Uint<64>;
+
+// Shielded XP token bookkeeping. `xpColor` is published on first mint so an off-chain reader
+// can identify the token; the nonce stream is bound to this deployment so two decks by the
+// same author never collide.
+export ledger xpColor: Bytes<32>;
+export ledger xpNonceSeed: Bytes<32>;
+export ledger xpNonceCounter: Counter;
+
+// ---------------------------------------------------------------------------
+// Witnesses
+// ---------------------------------------------------------------------------
+
+// The learner's (or author's) dapp secret. Unrelated to any wallet key: that is what makes
+// the pseudonym unlinkable to a wallet.
+witness localSk(): Bytes<32>;
+
+// The learner's running XP total and its blinding factor, held in private state. Both are
+// checked against `xpCommit` before use, so a dishonest witness cannot inflate a score.
+witness localXp(): Uint<64>;
+witness localXpSalt(): Bytes<32>;
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+// Domain-separated so this pseudonym cannot be correlated with the same secret's identity in
+// another dapp.
+export pure circuit dappPk(sk: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "srs:pk:"), sk]);
+}
+
+// Composite key for the per-learner-per-card schedule.
+export pure circuit slotKey(learner: Bytes<32>, card: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "srs:slot:"), learner, card]);
+}
+
+circuit me(): Bytes<32> {
+  return disclose(dappPk(localSk()));
+}
+
+// ---------------------------------------------------------------------------
+// Deploy / deck curation
+// ---------------------------------------------------------------------------
+
+// `initialCards` is a fixed-width vector of optionals so a deck can be seeded at deploy
+// without a variable-length argument (the `welcome.compact` pattern). Width is kept small to
+// keep the deploy proof quick; `publishCard` covers the rest.
+constructor(bond: Uint<64>, initialCards: Vector<8, Maybe<Bytes<32>>>) {
+  const a = disclose(dappPk(localSk()));
+  author = a;
+  bondRequired = disclose(bond);
+  forfeited = 0;
+  xpNonceSeed = persistentHash<Vector<2, Bytes<32>>>([pad(32, "srs:xp-nonce:"), a]);
+  for (const maybeCard of disclose(initialCards)) {
+    if (maybeCard.is_some) {
+      cards.insert(maybeCard.value);
+    }
+  }
+}
+
+export circuit publishCard(card: Bytes<32>): [] {
+  assert(me() == author, "Only the deck author may publish cards");
+  cards.insert(disclose(card));
+}
+
+// ---------------------------------------------------------------------------
+// Joining: the bond
+// ---------------------------------------------------------------------------
+
+// Post the bond and join the deck. The stake is what makes a second identity cost money;
+// without it the public ladder is Sybil bait.
+export circuit subscribe(): [] {
+  const learner = me();
+  assert(!learners.member(learner), "Already subscribed");
+
+  receiveUnshielded(nativeToken(), bondRequired as Uint<128>);
+
+  learners.insert(learner);
+  bonds.insert(learner, bondRequired);
+
+  // A learner who left (or was slashed) can rejoin by posting a fresh bond, so everything below
+  // is initialised only on a FIRST subscription. Overwriting on every subscribe would be wrong
+  // in two ways: it would erase a diligence record that is supposed to be permanent, and —
+  // worse — resetting `xpCommit` to zero while the learner's private state still held their real
+  // total would break the commitment chain, failing every subsequent review with a message about
+  // a mismatched XP witness rather than anything that pointed at the cause.
+  if (!xpCommit.member(learner)) {
+    reviewCount.insert(learner, 0);
+    lapseCount.insert(learner, 0);
+    // Open the XP commitment chain at zero, so the first review has a prior to check against.
+    xpCommit.insert(learner, disclose(persistentCommit<Uint<64>>(0, localXpSalt())));
+    tier.insert(learner, 0);
+  }
+}
+
+// Enrol a deck card into this learner's schedule.
+//
+// `firstDue` is bounded from above only, so a new card may be due immediately — but cannot be
+// parked in the far future to dodge the schedule.
+export circuit startCard(card: Bytes<32>, firstDue: Uint<64>): [] {
+  const learner = me();
+  assert(learners.member(learner), "Not subscribed");
+  const pubCard = disclose(card);
+  assert(cards.member(pubCard), "Card is not in this deck");
+
+  const k = slotKey(learner, pubCard);
+  assert(!sched.member(k), "Card already started");
+
+  const due = disclose(firstDue);
+  pinNotBeyond(due, DAY_SECS());
+  sched.insert(k, Sched {
+    dueAt: due,
+    intervalDays: INTERVAL_FIRST(),
+    ease: EASE_START(),
+    reps: 0,
+    lapses: 0
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Review — the heart of the contract
+// ---------------------------------------------------------------------------
+
+// Verify a proposed schedule transition and, if it holds, record it and pay the XP reward.
+//
+// `next` is computed off-chain (crates/srs-core) and treated as untrusted: every field is
+// re-derived here. `xpRecipient` is the learner's Zswap coin public key, needed because the
+// shielded reward is minted to the contract and forwarded.
+export circuit review(
+  card: Bytes<32>,
+  grade: Uint<8>,
+  next: Sched,
+  xpRecipient: ZswapCoinPublicKey
+): [] {
+  const learner = me();
+  assert(learners.member(learner), "Not subscribed");
+  assert(bonds.lookup(learner) > 0, "Bond has been withdrawn or slashed");
+
+  const pubCard = disclose(card);
+  const k = slotKey(learner, pubCard);
+  assert(sched.member(k), "Card not started");
+
+  const cur = sched.lookup(k);
+  const pubGrade = disclose(grade);
+  const pubNext = disclose(next);
+
+  // The card must actually be due. This is the one gate that forces `dueAt` public.
+  assert(blockTimeGte(cur.dueAt), "Card is not due yet");
+  assert(pubGrade <= GRADE_MAX(), "Grade out of range");
+
+  checkTransition(cur, pubGrade, pubNext);
+
+  // `nextDue` lands in (now, now + intervalDays * 86400].
+  pinToWindow(pubNext.dueAt, ((pubNext.intervalDays as Uint<64>) * DAY_SECS()) as Uint<64>);
+
+  sched.insert(k, pubNext);
+  reviewCount.insert(learner, (reviewCount.lookup(learner) + 1) as Uint<64>);
+  if (pubGrade < GRADE_PASS()) {
+    lapseCount.insert(learner, (lapseCount.lookup(learner) + 1) as Uint<64>);
+  }
+
+  // Reward scales with the interval earned, so the total is a meaningful retention measure —
+  // and therefore worth keeping private.
+  const award = pubNext.intervalDays as Uint<64>;
+  advanceXp(learner, award);
+  mintXpTo(disclose(xpRecipient), award);
+}
+
+// Re-derive the whole SM-2 transition and reject anything that does not match.
+circuit checkTransition(cur: Sched, grade: Uint<8>, next: Sched): [] {
+  const lapsed = grade < GRADE_PASS();
+
+  assert(next.ease == easeAfter(cur.ease, grade), "Illegal ease transition");
+
+  // Repetitions reset on a lapse.
+  const wantReps = lapsed ? 0 as Uint<16> : (cur.reps + 1) as Uint<16>;
+  assert(next.reps == wantReps, "Illegal repetition count");
+
+  const wantLapses = lapsed ? (cur.lapses + 1) as Uint<16> : cur.lapses;
+  assert(next.lapses == wantLapses, "Illegal lapse count");
+
+  // Interval. SM-2 fixes the first two, then grows multiplicatively.
+  assert(next.intervalDays >= INTERVAL_FIRST(), "Interval must be at least one day");
+  assert(next.intervalDays <= INTERVAL_MAX_DAYS(), "Interval exceeds maximum");
+  if (lapsed) {
+    assert(next.intervalDays == INTERVAL_FIRST(), "A lapse must reset the interval");
+  } else if (wantReps == 1) {
+    assert(next.intervalDays == INTERVAL_FIRST(), "First interval must be one day");
+  } else if (wantReps == 2) {
+    assert(next.intervalDays == INTERVAL_SECOND(), "Second interval must be six days");
+  } else {
+    checkIntervalGrowth(cur.intervalDays, next.ease, next.intervalDays);
+  }
+}
+
+// Ease moves by a flat penalty on a lapse, or by SM-2's quality delta on a pass:
+//
+//   EF += 0.1 - (5 - q) * (0.08 + (5 - q) * 0.02)
+//
+// Scaled by EASE_SCALE that is exact for every passing grade — q=5 -> +100, q=4 -> 0,
+// q=3 -> -140 — so no rounding is involved. Compact is unsigned, hence separate helpers for
+// the increase and the decrease rather than a signed delta.
+pure circuit easeAfter(ease: Uint<16>, grade: Uint<8>): Uint<16> {
+  return grade < GRADE_PASS() ? easeDown(ease, 200)
+       : grade == 3           ? easeDown(ease, 140)
+       : grade == 4           ? clampEase(ease as Uint<32>)
+       :                        clampEase((((ease as Uint<32>) + 100)) as Uint<32>);
+}
+
+// Guarded: unsigned subtraction would underflow for an ease at or below the penalty.
+pure circuit easeDown(ease: Uint<16>, penalty: Uint<16>): Uint<16> {
+  return ease <= penalty ? EASE_MIN() : clampEase((ease - penalty) as Uint<32>);
+}
+
+pure circuit clampEase(raw: Uint<32>): Uint<16> {
+  return raw < (EASE_MIN() as Uint<32>) ? EASE_MIN()
+       : raw > (EASE_MAX() as Uint<32>) ? EASE_MAX()
+       : raw as Uint<16>;
+}
+
+// Verify `want == floor(prev * ease / EASE_SCALE)` using only multiplication:
+//
+//   want * SCALE <= prev * ease < (want + 1) * SCALE
+//
+// Widened to Uint<64> throughout; the largest product is 36500 * 4000, far inside range.
+circuit checkIntervalGrowth(prev: Uint<32>, ease: Uint<16>, want: Uint<32>): [] {
+  const product = (prev as Uint<64>) * (ease as Uint<64>);
+  const scale = EASE_SCALE() as Uint<64>;
+  const lo = (want as Uint<64>) * scale;
+  assert(lo <= product, "Interval grew faster than ease allows");
+  // Skip the upper bound at the cap, where the true product exceeds the ceiling and
+  // flooring no longer applies.
+  if (want < INTERVAL_MAX_DAYS()) {
+    assert(product < (lo + scale) as Uint<64>, "Interval grew slower than ease requires");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Constraining prover-supplied timestamps
+//
+// Block time is comparable but not readable — there is no `now()` to assign from — so a
+// timestamp cannot be computed on-chain, only bracketed. Which edge of the bracket matters
+// differs per call site, and using the wrong one silently removes the constraint rather than
+// failing, so the three shapes are separate named circuits instead of one general helper:
+//
+//   pinToWindow   now < t <= now + window    both edges  (review's next due date)
+//   pinNotBeyond         t <= now + window   upper only  (a new card may be due immediately)
+//   pinAtLeast    now + delay < t            lower only  (an unbonding delay must not shrink)
+//
+// Every subtraction is guarded, because Compact's unsigned subtraction would underflow for a
+// `t` smaller than the window and the resulting comparison would pass vacuously.
+// ---------------------------------------------------------------------------
+
+// now < t <= now + window.
+//
+//   blockTimeLt(t)            =>  now <  t
+//   blockTimeGte(t - window)  =>  now >= t - window  =>  t <= now + window
+circuit pinToWindow(t: Uint<64>, window: Uint<64>): [] {
+  assert(blockTimeLt(t), "Timestamp must be in the future");
+  pinNotBeyond(t, window);
+}
+
+// t <= now + window, with no lower bound.
+//
+// For call sites where "already due" is a perfectly good answer. A newly enrolled card should
+// be studiable straight away, so demanding a strictly future due date would be wrong on the
+// merits — and would also make `startCard` fail whenever proving outran the lead time the
+// client had guessed.
+circuit pinNotBeyond(t: Uint<64>, window: Uint<64>): [] {
+  assert(t >= window, "Timestamp precedes the window");
+  assert(blockTimeGte((t - window) as Uint<64>), "Timestamp is too far in the future");
+}
+
+// now + delay < t.
+//
+//   blockTimeLt(t - delay)  =>  now < t - delay  =>  t > now + delay
+//
+// This is the direction a cooldown needs, and it is the exact opposite of `pinToWindow`'s upper
+// bound. Bracketing a delay from above instead would let the caller name a `t` one second out
+// and skip the wait entirely — which would leave `slash` trivially dodgeable.
+circuit pinAtLeast(t: Uint<64>, delay: Uint<64>): [] {
+  assert(t >= delay, "Timestamp precedes the delay");
+  assert(blockTimeLt((t - delay) as Uint<64>), "Timestamp must be at least the delay in the future");
+}
+
+// ---------------------------------------------------------------------------
+// XP: private score, private reward
+// ---------------------------------------------------------------------------
+
+// Advance the commitment chain. Checking the *old* commitment before writing the new one is
+// what stops a learner witnessing an inflated total.
+circuit advanceXp(learner: Bytes<32>, award: Uint<64>): [] {
+  const salt = localXpSalt();
+  const prior = localXp();
+  assert(disclose(persistentCommit<Uint<64>>(prior, salt)) == xpCommit.lookup(learner),
+    "XP witness does not match the committed total");
+  const updated = (prior + award) as Uint<64>;
+  xpCommit.insert(learner, disclose(persistentCommit<Uint<64>>(updated, salt)));
+}
+
+// Mint the shielded reward to the contract, then forward it — the "mint to self then send"
+// pattern. Two coin operations, which keeps `review` inside the node's effects budget
+// (three per circuit; see EffectsCheckFailure 186).
+circuit mintXpTo(recipient: ZswapCoinPublicKey, amount: Uint<64>): [] {
+  xpNonceCounter.increment(1);
+  const nonce = evolveNonce(xpNonceCounter.read() as Uint<128>, xpNonceSeed);
+  xpNonceSeed = nonce;
+
+  const coin = mintShieldedToken(
+    pad(32, "srs:xp:"),
+    amount,
+    nonce,
+    right<ZswapCoinPublicKey, ContractAddress>(kernel.self())
+  );
+  if (xpColor == default<Bytes<32>>) {
+    xpColor = coin.color;
+  }
+  const qualified = QualifiedShieldedCoinInfo {
+    nonce: coin.nonce,
+    color: coin.color,
+    value: coin.value,
+    mt_index: 0 as Uint<64>
+  };
+  sendShielded(
+    qualified,
+    left<ZswapCoinPublicKey, ContractAddress>(recipient),
+    amount as Uint<128>
+  );
+}
+
+// Publish a tier by proving the private XP total clears a threshold. The total itself is
+// never disclosed; the only leak is the single bit that it is at or above the line — which
+// is the entire point of a tier.
+export circuit claimTier(newTier: Uint<8>, threshold: Uint<64>): [] {
+  const learner = me();
+  assert(learners.member(learner), "Not subscribed");
+
+  const salt = localXpSalt();
+  const total = localXp();
+  assert(disclose(persistentCommit<Uint<64>>(total, salt)) == xpCommit.lookup(learner),
+    "XP witness does not match the committed total");
+  assert(total >= disclose(threshold), "XP below the claimed tier's threshold");
+  assert(disclose(newTier) > tier.lookup(learner), "Tier must increase");
+
+  tier.insert(learner, disclose(newTier));
+}
+
+// ---------------------------------------------------------------------------
+// Accountability: slashing and exit
+// ---------------------------------------------------------------------------
+
+// Permissionless. Anyone can prove a learner blew a deadline, so the ladder does not depend
+// on the author policing it. `blockTimeGte(dueAt + GRACE_SECS)` is the whole proof — the
+// deadline was public and the clock is the witness.
+export circuit slash(learner: Bytes<32>, card: Bytes<32>): [] {
+  const pubLearner = disclose(learner);
+  const pubCard = disclose(card);
+  assert(learners.member(pubLearner), "Not a learner");
+  const staked = bonds.lookup(pubLearner);
+  assert(staked > 0, "Nothing left to slash");
+
+  const k = slotKey(pubLearner, pubCard);
+  assert(sched.member(k), "Card not started");
+  assert(blockTimeGte((sched.lookup(k).dueAt + GRACE_SECS()) as Uint<64>),
+    "Card is not yet overdue past the grace period");
+
+  forfeited = (forfeited + staked) as Uint<64>;
+  bonds.insert(pubLearner, 0);
+  lapseCount.insert(pubLearner, (lapseCount.lookup(pubLearner) + 1) as Uint<64>);
+  // Drop membership rather than leaving them wedged: with a zero bond they can neither review
+  // nor withdraw, and `subscribe` refuses an existing member, so they could never rejoin. Their
+  // review and lapse tallies persist — the record of what happened is the point.
+  learners.remove(pubLearner);
+}
+
+// Start the unbonding clock. `readyAt` is pinned to the same window discipline as due dates,
+// so a learner cannot name an instant already in the past and exit immediately.
+export circuit requestUnbond(readyAt: Uint<64>): [] {
+  const learner = me();
+  assert(learners.member(learner), "Not subscribed");
+  assert(bonds.lookup(learner) > 0, "No bond to withdraw");
+  const ready = disclose(readyAt);
+  pinAtLeast(ready, UNBOND_COOLDOWN_SECS());
+  unbondReadyAt.insert(learner, ready);
+}
+
+// Exit with the bond, once the cooldown has elapsed. The delay is what stops a learner
+// racing a pending `slash`.
+export circuit withdrawBond(to: UserAddress): [] {
+  const learner = me();
+  assert(learners.member(learner), "Not subscribed");
+  const amount = bonds.lookup(learner);
+  assert(amount > 0, "No bond to withdraw");
+  assert(unbondReadyAt.member(learner), "Call requestUnbond first");
+  assert(blockTimeGte(unbondReadyAt.lookup(learner)), "Unbonding cooldown has not elapsed");
+
+  bonds.insert(learner, 0);
+  learners.remove(learner);
+  // Consume the request. Leaving it behind would let a learner who rejoins later skip the
+  // cooldown entirely, since the stale `readyAt` is already in the past.
+  unbondReadyAt.remove(learner);
+  sendUnshielded(nativeToken(), amount as Uint<128>, right<ContractAddress, UserAddress>(disclose(to)));
+}
+
+// Sweep slashed bonds. One recipient, hence one coin operation.
+//
+// Redistributing the pot across the learners who kept their streaks is the more interesting
+// policy, but it cannot be a single circuit: the effects budget caps coin operations at
+// three, so an N-way payout has to be N pull-based claims (the shape `roulette.compact` uses
+// for `claimMyBet` / `claimMatch`). Left as an extension.
+export circuit sweepForfeited(to: UserAddress): [] {
+  assert(me() == author, "Only the deck author may sweep forfeited bonds");
+  const amount = forfeited;
+  assert(amount > 0, "Nothing forfeited");
+  forfeited = 0;
+  sendUnshielded(nativeToken(), amount as Uint<128>, right<ContractAddress, UserAddress>(disclose(to)));
+}

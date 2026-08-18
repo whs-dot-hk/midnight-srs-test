@@ -1,0 +1,13 @@
+{
+  "name": "kanji-basics",
+  "cards": [
+    { "front": "水", "back": "water — mizu" },
+    { "front": "火", "back": "fire — hi" },
+    { "front": "山", "back": "mountain — yama" },
+    { "front": "川", "back": "river — kawa" },
+    { "front": "木", "back": "tree — ki" },
+    { "front": "日", "back": "sun, day — hi/nichi" },
+    { "front": "月", "back": "moon, month — tsuki/getsu" },
+    { "front": "人", "back": "person — hito/jin" }
+  ]
+}

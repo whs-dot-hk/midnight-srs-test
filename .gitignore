@@ -1,0 +1,19 @@
+# Rust
+/target
+
+# Node
+node_modules/
+ts/dist/
+
+# Compact build output. The generated bindings and ZK keys are large and fully
+# reproducible from src/*.compact via `yarn compact`, so they are not tracked.
+contracts/src/managed/
+
+# Private state and wallet caches — these hold the secret behind a learner's
+# pseudonym and their XP total. Never commit them.
+midnight-level-db*/
+.cache/
+
+# Seeds. Copy .env.preview.example to .env.preview.
+.env.*
+!.env.*.example

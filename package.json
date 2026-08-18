@@ -1,0 +1,33 @@
+{
+  "name": "midnight-srs-test",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "packageManager": "yarn@1.22.22",
+  "workspaces": [
+    "contracts",
+    "ts"
+  ],
+  "scripts": {
+    "srs": "yarn workspace @midnight-srs/ts srs",
+    "doctor": "yarn srs doctor",
+    "setup": "yarn compact && yarn build",
+    "compact": "cd contracts && compact compile src/srs.compact src/managed/srs",
+    "compact:fast": "cd contracts && compact compile --skip-zk src/srs.compact src/managed/srs",
+    "core": "cargo build --release",
+    "core:test": "cargo test",
+    "build": "yarn core && yarn workspace @midnight-srs/ts build",
+    "typecheck": "yarn workspace @midnight-srs/ts typecheck",
+    "check:params": "python3 scripts/check-params.py",
+    "verify": "yarn check:params && yarn core:test && yarn typecheck"
+  },
+  "resolutions": {
+    "//": "One copy of each WASM-backed runtime package, tree-wide. Two copies give two class identities and every `instanceof` inside proving fails \u2014 `expected instance of LedgerParameters` / `ContractMaintenanceAuthority`. These exact versions are the combination known to work together.",
+    "@midnight-ntwrk/ledger-v8": "8.1.0",
+    "@midnight-ntwrk/onchain-runtime-v3": "3.0.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

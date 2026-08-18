@@ -1,0 +1,24 @@
+{
+  "name": "@midnight-srs/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "//": "compact emits ESM plus .d.ts directly into src/managed, so this package needs no build step of its own \u2014 it just gives the generated bindings a module name.",
+  "main": "src/managed/srs/contract/index.js",
+  "types": "src/managed/srs/contract/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/managed/srs/contract/index.d.ts",
+      "import": "./src/managed/srs/contract/index.js",
+      "default": "./src/managed/srs/contract/index.js"
+    }
+  },
+  "scripts": {
+    "compact": "compact compile src/srs.compact src/managed/srs",
+    "compact:fast": "compact compile --skip-zk src/srs.compact src/managed/srs"
+  },
+  "dependencies": {
+    "@midnight-ntwrk/compact-runtime": "0.16.0"
+  }
+}

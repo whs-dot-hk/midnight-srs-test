@@ -1,0 +1,40 @@
+{
+  "name": "@midnight-srs/ts",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "srs": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc --project tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "srs": "node dist/cli.js"
+  },
+  "dependencies": {
+    "@midnight-srs/contracts": "*",
+    "@midnight-ntwrk/compact-runtime": "0.16.0",
+    "@midnight-ntwrk/midnight-js-contracts": "^4.1.1",
+    "@midnight-ntwrk/midnight-js-http-client-proof-provider": "^4.1.1",
+    "@midnight-ntwrk/midnight-js-indexer-public-data-provider": "^4.1.1",
+    "@midnight-ntwrk/midnight-js-level-private-state-provider": "^4.1.1",
+    "@midnight-ntwrk/midnight-js-network-id": "^4.1.1",
+    "@midnight-ntwrk/midnight-js-node-zk-config-provider": "^4.1.1",
+    "@midnight-ntwrk/midnight-js-protocol": "^4.1.1",
+    "@midnight-ntwrk/midnight-js-types": "^4.1.1",
+    "@midnight-ntwrk/midnight-js-utils": "^4.1.1",
+    "@midnightntwrk/wallet-sdk": "^1.2.0",
+    "buffer": "^6.0.3",
+    "effect": "^3.21.2",
+    "rxjs": "^7.8.1",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.9.2",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.9.3"
+  }
+}
